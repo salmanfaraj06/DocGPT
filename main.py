@@ -111,4 +111,4 @@ def query_documents():
         return jsonify({"error": "Error processing the query"}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
