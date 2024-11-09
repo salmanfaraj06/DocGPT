@@ -9,43 +9,57 @@ from langchain_openai import OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+import fitz
+from langchain.docstore.document import Document
+import io
+from googleapiclient.http import MediaIoBaseDownload
 
-# Load environment variables from .env file
+from streamlit_app import authenticate_drive
+
+# Load environment variables
 load_dotenv()
-
-# Set environment variables
 openai_api_key = os.getenv("OPENAI_API_KEY")
 os.environ["OPENAI_API_KEY"] = openai_api_key
 
 app = Flask(__name__)
-
-# Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger()
 
-# Initialize ChromaDB client and paths
 chroma_client = chromadb.Client()
-document_directory = "contents"  # Location of your PDFs
 persist_directory = "chroma_persist"
 
-def create_vector_db(doc_dir):
+
+# Function to download and extract text from PDF files
+def download_pdf_text(service, file_id):
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    fh.seek(0)
+    return extract_text_from_pdf(fh)
+
+
+def extract_text_from_pdf(file_obj):
+    text = ""
+    with fitz.open(stream=file_obj, filetype="pdf") as doc:
+        for page in doc:
+            text += page.get_text()
+    return text
+
+
+# Function to create vector database
+def create_vector_db(service, file_id):
+    if not file_id:
+        logger.error("Missing required parameter 'fileId'")
+        return None
+
     try:
-        logger.info(f"Starting vector database creation for {doc_dir}.")
-
-        if os.path.isdir(doc_dir):
-            loader = DirectoryLoader(doc_dir, glob="**/*.pdf", loader_cls=PyPDFLoader)
-        elif doc_dir.endswith(".pdf"):
-            loader = PyPDFLoader(doc_dir)
-        else:
-            raise ValueError("Provided path must be a directory of PDFs or a single PDF file.")
-
-        documents = loader.load()
-        logger.info(f"Loaded {len(documents)} documents.")
-
+        pdf_text = download_pdf_text(service, file_id)
+        document = Document(page_content=pdf_text)
         text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-        texts = text_splitter.split_documents(documents)
-        logger.info(f"Split documents into {len(texts)} chunks for embedding.")
+        texts = text_splitter.split_documents([document])
 
         embeddings = OpenAIEmbeddings()
         vectordb = Chroma.from_documents(
@@ -55,16 +69,14 @@ def create_vector_db(doc_dir):
             client=chroma_client,
             collection_name="customer_info"
         )
-
-        logger.info("Vector database creation successful.")
         return vectordb
 
     except Exception as e:
-        logger.error(f"Error in creating vector database: {e}")
+        logger.error(f"Error creating vector database: {e}")
         return None
 
-vectordb = create_vector_db(document_directory)
 
+# Template for prompt
 template = """
 You are an expert assistant with extensive knowledge in various domains. Use the provided context to answer the question accurately and concisely. If the answer is not in the context, state that you don't know.
 
@@ -81,18 +93,22 @@ Question:
 """
 PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
 
+
+# Query route
 @app.route("/query", methods=["POST"])
 def query_documents():
     data = request.get_json()
     query = data.get("query")
+    file_id = data.get("file_id")
+    service = authenticate_drive()  # Ensure service is authenticated
 
-    if not vectordb:
-        logger.error("Vector database is not initialized.")
-        return jsonify({"error": "Vector database is not initialized"}), 500
+    # Pass file_id to the vector database function
+    vectordb = create_vector_db(service, file_id)
+
+    if vectordb is None:
+        return jsonify({"error": "Failed to create vector database"}), 500
 
     try:
-        logger.info(f"Processing query: {query}")
-
         qa = RetrievalQA.from_chain_type(
             llm=OpenAI(api_key=openai_api_key),
             chain_type="stuff",
@@ -101,14 +117,11 @@ def query_documents():
             chain_type_kwargs={"prompt": PROMPT}
         )
         result = qa({"query": query})
-        answer = result["result"]
-
-        logger.info(f"Query answered successfully: {answer}")
-        return jsonify({"answer": answer})
+        return jsonify({"answer": result["result"]})
 
     except Exception as e:
-        logger.error(f"Error in retrieving answer: {e}")
-        return jsonify({"error": "Error processing the query"}), 500
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run()
