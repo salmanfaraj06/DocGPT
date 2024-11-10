@@ -1,63 +1,164 @@
-import os
-import chromadb
-import logging
+# main.py
 from flask import Flask, request, jsonify
-from langchain_openai import OpenAI
-from langchain.text_splitter import CharacterTextSplitter
+from langchain_openai import OpenAI, OpenAIEmbeddings
 from langchain.chains import RetrievalQA
-from langchain_openai import OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
-from dotenv import load_dotenv
+from googleapiclient.http import MediaIoBaseDownload
+import io
+import logging
+from typing import Optional, Tuple, List
+from config import CONFIG
+from document_processor import DocumentFactory
+from vector_store import VectorStore
+from app import authenticate_drive, list_drive_items
+from langchain.docstore.document import Document
+from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 import fitz
-from langchain.docstore.document import Document
-import io
-from googleapiclient.http import MediaIoBaseDownload
-
-from streamlit_app import authenticate_drive
-
-# Load environment variables
-load_dotenv()
-openai_api_key = os.getenv("OPENAI_API_KEY")
-os.environ["OPENAI_API_KEY"] = openai_api_key
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger()
+vector_store = VectorStore()
+openai_api_key = CONFIG["OPENAI_API_KEY"]
 
-chroma_client = chromadb.Client()
-persist_directory = "chroma_persist"
+def download_file(service, file_id: str) -> Optional[str]:
+    try:
+        file_metadata = service.files().get(fileId=file_id, fields='mimeType').execute()
+        mime_type = file_metadata['mimeType']
+        
+        if mime_type == "application/vnd.google-apps.folder":
+            return None  # Skip folders
 
+        if mime_type not in CONFIG["SUPPORTED_MIME_TYPES"]:
+            raise ValueError(f"Unsupported file type: {mime_type}")
 
-# Function to download and extract text from PDF files
-def download_pdf_text(service, file_id):
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    fh.seek(0)
-    return extract_text_from_pdf(fh)
-
-
-def extract_text_from_pdf(file_obj):
-    text = ""
-    with fitz.open(stream=file_obj, filetype="pdf") as doc:
-        for page in doc:
-            text += page.get_text()
-    return text
-
-
-# Function to create vector database
-def create_vector_db(service, file_id):
-    if not file_id:
-        logger.error("Missing required parameter 'fileId'")
+        request = service.files().get_media(fileId=file_id)
+        file_obj = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_obj, request)
+        
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        
+        file_obj.seek(0)
+        
+        processor = DocumentFactory.get_processor(mime_type)
+        if processor:
+            return processor.extract_text(file_obj)
+        else:
+            raise ValueError(f"Unsupported file type: {mime_type}")
+    except Exception as e:
+        logging.error(f"Error downloading file: {e}")
         return None
 
+def download_folder_contents(service, folder_id: str) -> List[str]:
     try:
-        pdf_text = download_pdf_text(service, file_id)
-        document = Document(page_content=pdf_text)
+        items = list_drive_items(service, parent_id=folder_id)
+        file_texts = []
+        for item in items:
+            if item["mimeType"] == "application/vnd.google-apps.folder":
+                file_texts.extend(download_folder_contents(service, item["id"]))
+            else:
+                file_text = download_file(service, item["id"])
+                if file_text:
+                    file_texts.append(file_text)
+        return file_texts
+    except Exception as e:
+        logging.error(f"Error downloading folder contents: {e}")
+        return []
+
+PROMPT_TEMPLATE = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""
+You are an expert assistant with extensive knowledge in various domains. Use the provided context to answer the question accurately and concisely.
+
+Context:
+{context}
+
+Question: {question}
+
+Instructions:
+- Provide a detailed and accurate answer based on the context
+- If the information isn't in the context, state "I don't have enough information to answer this question"
+- Include relevant quotes or references from the document when applicable
+- Be clear and concise in your response
+
+Answer:
+"""
+)
+
+@app.route("/query", methods=["POST"])
+def query_documents():
+    data = request.get_json()
+    logging.info(f"Received request data: {data}")
+
+    query = data.get("query")
+    file_ids = data.get("file_ids")
+
+    if not query or not file_ids:
+        logging.error("Missing 'query' or 'file_ids' in request")
+        return jsonify({"error": "Missing 'query' or 'file_ids' in request"}), 400
+
+    service = authenticate_drive()  # Ensure service is authenticated
+
+    documents = []
+    for file_id in file_ids:
+        file_metadata = service.files().get(fileId=file_id, fields='mimeType').execute()
+        mime_type = file_metadata['mimeType']
+        if mime_type == "application/vnd.google-apps.folder":
+            folder_texts = download_folder_contents(service, file_id)
+            for text in folder_texts:
+                documents.append(Document(page_content=text))
+        else:
+            file_text = download_file(service, file_id)
+            if file_text is None:
+                logging.error(f"Failed to download file with ID {file_id}")
+                return jsonify({"error": f"Failed to download file with ID {file_id}"}), 500
+            documents.append(Document(page_content=file_text))
+
+    if not documents:
+        logging.error("No valid documents found")
+        return jsonify({"error": "No valid documents found"}), 400
+
+    try:
+        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+        texts = text_splitter.split_documents(documents)
+
+        embeddings = OpenAIEmbeddings()
+        vectordb = Chroma.from_documents(
+            texts,
+            embeddings,
+            persist_directory=CONFIG["PERSIST_DIRECTORY"],
+            client=vector_store.client,
+            collection_name="customer_info"
+        )
+
+        qa = RetrievalQA.from_chain_type(
+            llm=OpenAI(api_key=openai_api_key),
+            chain_type="stuff",
+            retriever=vectordb.as_retriever(search_kwargs={"k": 2}),
+            return_source_documents=True,
+            chain_type_kwargs={"prompt": PROMPT_TEMPLATE}
+        )
+        result = qa.invoke({"query": query})  # Use invoke method to avoid deprecation warning
+        return jsonify({"answer": result["result"]})
+
+    except Exception as e:
+        logging.error(f"Error creating vector database: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/process", methods=["POST"])
+def process_file():
+    data = request.get_json()
+    file_id = data.get("file_id")
+    mime_type = data.get("mime_type")
+    service = authenticate_drive()  # Ensure service is authenticated
+
+    try:
+        file_text = download_file(service, file_id)
+        if file_text is None:
+            return jsonify({"error": "Failed to download file"}), 500
+
+        document = Document(page_content=file_text)
         text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
         texts = text_splitter.split_documents([document])
 
@@ -65,63 +166,15 @@ def create_vector_db(service, file_id):
         vectordb = Chroma.from_documents(
             texts,
             embeddings,
-            persist_directory=persist_directory,
-            client=chroma_client,
+            persist_directory=CONFIG["PERSIST_DIRECTORY"],
+            client=vector_store.client,
             collection_name="customer_info"
         )
-        return vectordb
+        return jsonify({"message": "File processed successfully"})
 
     except Exception as e:
-        logger.error(f"Error creating vector database: {e}")
-        return None
-
-
-# Template for prompt
-template = """
-You are an expert assistant with extensive knowledge in various domains. Use the provided context to answer the question accurately and concisely. If the answer is not in the context, state that you don't know.
-
-Context:
-{context}
-
-Instructions:
-- Provide a detailed and accurate answer based on the context.
-- If the context does not contain the answer, respond with "I don't know."
-- Do not make up any information.
-
-Question:
-{question}
-"""
-PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
-
-
-# Query route
-@app.route("/query", methods=["POST"])
-def query_documents():
-    data = request.get_json()
-    query = data.get("query")
-    file_id = data.get("file_id")
-    service = authenticate_drive()  # Ensure service is authenticated
-
-    # Pass file_id to the vector database function
-    vectordb = create_vector_db(service, file_id)
-
-    if vectordb is None:
-        return jsonify({"error": "Failed to create vector database"}), 500
-
-    try:
-        qa = RetrievalQA.from_chain_type(
-            llm=OpenAI(api_key=openai_api_key),
-            chain_type="stuff",
-            retriever=vectordb.as_retriever(search_kwargs={"k": 2}),
-            return_source_documents=True,
-            chain_type_kwargs={"prompt": PROMPT}
-        )
-        result = qa({"query": query})
-        return jsonify({"answer": result["result"]})
-
-    except Exception as e:
+        logging.error(f"Error processing file {file_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
-
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=False)
